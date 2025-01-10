@@ -8,59 +8,60 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/in-toto/in-toto-golang/in_toto"
-	"github.com/kyverno/kyverno/pkg/registryclient"
+	"github.com/kyverno/kyverno/ext/wildcard"
+	"github.com/kyverno/kyverno/pkg/images"
 	"github.com/kyverno/kyverno/pkg/tracing"
 	datautils "github.com/kyverno/kyverno/pkg/utils/data"
-	wildcard "github.com/kyverno/kyverno/pkg/utils/wildcard"
-	"github.com/sigstore/cosign/cmd/cosign/cli/fulcio"
-	"github.com/sigstore/cosign/cmd/cosign/cli/options"
-	"github.com/sigstore/cosign/cmd/cosign/cli/rekor"
-	"github.com/sigstore/cosign/pkg/cosign"
-	"github.com/sigstore/cosign/pkg/cosign/attestation"
-	"github.com/sigstore/cosign/pkg/oci"
-	"github.com/sigstore/cosign/pkg/oci/remote"
-	sigs "github.com/sigstore/cosign/pkg/signature"
+	"github.com/sigstore/cosign/v2/pkg/cosign"
+	"github.com/sigstore/cosign/v2/pkg/cosign/attestation"
+	"github.com/sigstore/cosign/v2/pkg/oci"
+	"github.com/sigstore/cosign/v2/pkg/oci/remote"
+	sigs "github.com/sigstore/cosign/v2/pkg/signature"
+	rekorclient "github.com/sigstore/rekor/pkg/client"
 	"github.com/sigstore/sigstore/pkg/cryptoutils"
+	"github.com/sigstore/sigstore/pkg/fulcioroots"
 	"github.com/sigstore/sigstore/pkg/signature"
 	"github.com/sigstore/sigstore/pkg/signature/payload"
+	"github.com/sigstore/sigstore/pkg/tuf"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/multierr"
 )
 
-// ImageSignatureRepository is an alternate signature repository
-var ImageSignatureRepository string
-
-type Options struct {
-	ImageRef             string
-	FetchAttestations    bool
-	Key                  string
-	Cert                 string
-	CertChain            string
-	Roots                string
-	Subject              string
-	Issuer               string
-	AdditionalExtensions map[string]string
-	Annotations          map[string]string
-	Repository           string
-	RekorURL             string
-	SignatureAlgorithm   string
-	PredicateType        string
+var signatureAlgorithmMap = map[string]crypto.Hash{
+	"":       crypto.SHA256,
+	"sha224": crypto.SHA224,
+	"sha256": crypto.SHA256,
+	"sha384": crypto.SHA384,
+	"sha512": crypto.SHA512,
 }
 
-type Response struct {
-	Digest     string
-	Statements []map[string]interface{}
+func NewVerifier() images.ImageVerifier {
+	return &cosignVerifier{}
 }
 
-type CosignError struct{}
+type cosignVerifier struct{}
 
-// VerifySignature verifies that the image has the expected signatures
-func VerifySignature(ctx context.Context, rclient registryclient.Client, opts Options) (*Response, error) {
-	ref, err := name.ParseReference(opts.ImageRef)
+func (v *cosignVerifier) VerifySignature(ctx context.Context, opts images.Options) (*images.Response, error) {
+	if opts.SigstoreBundle {
+		results, err := verifyBundleAndFetchAttestations(ctx, opts)
+		if err != nil {
+			return nil, err
+		}
+
+		if len(results) == 0 {
+			return nil, fmt.Errorf("sigstore bundle verification failed: no matching signatures found")
+		}
+
+		return &images.Response{Digest: results[0].Desc.Digest.String()}, nil
+	}
+
+	nameOpts := opts.Client.NameOptions()
+	ref, err := name.ParseReference(opts.ImageRef, nameOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse image %s", opts.ImageRef)
 	}
@@ -70,7 +71,7 @@ func VerifySignature(ctx context.Context, rclient registryclient.Client, opts Op
 		"",
 		"VERIFY IMG SIGS",
 		func(ctx context.Context, span trace.Span) ([]oci.Signature, bool, error) {
-			cosignOpts, err := buildCosignOptions(ctx, rclient, opts)
+			cosignOpts, err := buildCosignOptions(ctx, opts)
 			if err != nil {
 				return nil, false, err
 			}
@@ -88,7 +89,7 @@ func VerifySignature(ctx context.Context, rclient registryclient.Client, opts Op
 		return nil, err
 	}
 
-	if err := matchSignatures(signatures, opts.Subject, opts.Issuer, opts.AdditionalExtensions); err != nil {
+	if err := matchSignatures(signatures, opts.Subject, opts.SubjectRegExp, opts.Issuer, opts.IssuerRegExp, opts.AdditionalExtensions); err != nil {
 		return nil, err
 	}
 
@@ -98,33 +99,27 @@ func VerifySignature(ctx context.Context, rclient registryclient.Client, opts Op
 	}
 
 	var digest string
-	if opts.PredicateType == "" {
+	if opts.Type == "" {
 		digest, err = extractDigest(opts.ImageRef, payload)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	return &Response{Digest: digest}, nil
+	return &images.Response{Digest: digest}, nil
 }
 
-func buildCosignOptions(ctx context.Context, rclient registryclient.Client, opts Options) (*cosign.CheckOpts, error) {
-	var remoteOpts []remote.Option
+func buildCosignOptions(ctx context.Context, opts images.Options) (*cosign.CheckOpts, error) {
 	var err error
-	signatureAlgorithmMap := map[string]crypto.Hash{
-		"":       crypto.SHA256,
-		"sha256": crypto.SHA256,
-		"sha512": crypto.SHA512,
-	}
-	ro := options.RegistryOptions{}
-	remoteOpts, err = ro.ClientOpts(ctx)
+
+	options, err := opts.Client.Options(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("constructing client options: %w", err)
+		return nil, fmt.Errorf("constructing cosign remote options: %w", err)
 	}
-	remoteOpts = append(remoteOpts, rclient.BuildRemoteOption(ctx))
+
 	cosignOpts := &cosign.CheckOpts{
 		Annotations:        map[string]interface{}{},
-		RegistryClientOpts: remoteOpts,
+		RegistryClientOpts: []remote.Option{remote.WithRemoteOptions(options...)},
 	}
 
 	if opts.FetchAttestations {
@@ -141,15 +136,20 @@ func buildCosignOptions(ctx context.Context, rclient registryclient.Client, opts
 		cosignOpts.RootCerts = cp
 	}
 
+	signatureAlgorithm, ok := signatureAlgorithmMap[opts.SignatureAlgorithm]
+	if !ok {
+		return nil, fmt.Errorf("invalid signature algorithm provided %s", opts.SignatureAlgorithm)
+	}
+
 	if opts.Key != "" {
 		if strings.HasPrefix(strings.TrimSpace(opts.Key), "-----BEGIN PUBLIC KEY-----") {
-			cosignOpts.SigVerifier, err = decodePEM([]byte(opts.Key), signatureAlgorithmMap[opts.SignatureAlgorithm])
+			cosignOpts.SigVerifier, err = decodePEM([]byte(opts.Key), signatureAlgorithm)
 			if err != nil {
 				return nil, fmt.Errorf("failed to load public key from PEM: %w", err)
 			}
 		} else {
 			// this supports Kubernetes secrets and KMS
-			cosignOpts.SigVerifier, err = sigs.PublicKeyFromKeyRef(ctx, opts.Key)
+			cosignOpts.SigVerifier, err = sigs.PublicKeyFromKeyRefWithHashAlgo(ctx, opts.Key, signatureAlgorithm)
 			if err != nil {
 				return nil, fmt.Errorf("failed to load public key from %s: %w", opts.Key, err)
 			}
@@ -163,7 +163,7 @@ func buildCosignOptions(ctx context.Context, rclient registryclient.Client, opts
 			}
 
 			if opts.CertChain == "" {
-				cosignOpts.SigVerifier, err = signature.LoadVerifier(cert.PublicKey, crypto.SHA256)
+				cosignOpts.SigVerifier, err = signature.LoadVerifier(cert.PublicKey, signatureAlgorithm)
 				if err != nil {
 					return nil, fmt.Errorf("failed to load signature from certificate: %w", err)
 				}
@@ -188,7 +188,7 @@ func buildCosignOptions(ctx context.Context, rclient registryclient.Client, opts
 		} else {
 			// if key, cert, and roots are not provided, default to Fulcio roots
 			if cosignOpts.RootCerts == nil {
-				roots, err := fulcio.GetRoots()
+				roots, err := fulcioroots.Get()
 				if err != nil {
 					return nil, fmt.Errorf("failed to get roots from fulcio: %w", err)
 				}
@@ -200,10 +200,24 @@ func buildCosignOptions(ctx context.Context, rclient registryclient.Client, opts
 		}
 	}
 
-	if opts.RekorURL != "" {
-		cosignOpts.RekorClient, err = rekor.NewClient(opts.RekorURL)
+	cosignOpts.IgnoreTlog = opts.IgnoreTlog
+	if !opts.IgnoreTlog {
+		cosignOpts.RekorClient, err = rekorclient.GetRekorClient(opts.RekorURL)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create Rekor client from URL %s: %w", opts.RekorURL, err)
+		}
+
+		cosignOpts.RekorPubKeys, err = getRekorPubs(ctx, opts.RekorPubKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load Rekor public keys: %w", err)
+		}
+	}
+
+	cosignOpts.IgnoreSCT = opts.IgnoreSCT
+	if !opts.IgnoreSCT {
+		cosignOpts.CTLogPubKeys, err = getCTLogPubs(ctx, opts.CTLogsPubKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load CTLogs public keys: %w", err)
 		}
 	}
 
@@ -216,6 +230,22 @@ func buildCosignOptions(ctx context.Context, rclient registryclient.Client, opts
 		cosignOpts.RegistryClientOpts = append(cosignOpts.RegistryClientOpts, remote.WithTargetRepository(signatureRepo))
 	}
 
+	if opts.TSACertChain != "" {
+		leaves, intermediates, roots, err := splitPEMCertificateChain([]byte(opts.TSACertChain))
+		if err != nil {
+			return nil, fmt.Errorf("error splitting tsa certificates: %w", err)
+		}
+		if len(leaves) > 1 {
+			return nil, fmt.Errorf("certificate chain must contain at most one TSA certificate")
+		}
+		if len(leaves) == 1 {
+			cosignOpts.TSACertificate = leaves[0]
+		}
+		cosignOpts.TSAIntermediateCertificates = intermediates
+		cosignOpts.TSARootCertificates = roots
+	}
+
+	cosignOpts.ExperimentalOCI11 = opts.CosignOCI11
 	return cosignOpts, nil
 }
 
@@ -250,20 +280,35 @@ func loadCertChain(pem []byte) ([]*x509.Certificate, error) {
 	return cryptoutils.LoadCertificatesFromPEM(bytes.NewReader(pem))
 }
 
-// FetchAttestations retrieves signed attestations and decodes them into in-toto statements
-// https://github.com/in-toto/attestation/blob/main/spec/README.md#statement
-func FetchAttestations(ctx context.Context, rclient registryclient.Client, opts Options) (*Response, error) {
-	cosignOpts, err := buildCosignOptions(ctx, rclient, opts)
+func (v *cosignVerifier) FetchAttestations(ctx context.Context, opts images.Options) (*images.Response, error) {
+	if opts.SigstoreBundle {
+		results, err := verifyBundleAndFetchAttestations(ctx, opts)
+		if err != nil {
+			return nil, err
+		}
+
+		if len(results) == 0 {
+			return nil, fmt.Errorf("sigstore bundle verification failed: no matching signatures found")
+		}
+
+		statements, err := decodeStatementsFromBundles(results)
+		if err != nil {
+			return nil, err
+		}
+		return &images.Response{Digest: results[0].Desc.Digest.String(), Statements: statements}, nil
+	}
+	cosignOpts, err := buildCosignOptions(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
 
+	nameOpts := opts.Client.NameOptions()
 	signatures, bundleVerified, err := tracing.ChildSpan3(
 		ctx,
 		"",
 		"VERIFY IMG ATTESTATIONS",
 		func(ctx context.Context, span trace.Span) (checkedAttestations []oci.Signature, bundleVerified bool, err error) {
-			ref, err := name.ParseReference(opts.ImageRef)
+			ref, err := name.ParseReference(opts.ImageRef, nameOpts...)
 			if err != nil {
 				return nil, false, fmt.Errorf("failed to parse image: %w", err)
 			}
@@ -286,17 +331,17 @@ func FetchAttestations(ctx context.Context, rclient registryclient.Client, opts 
 	}
 
 	for _, signature := range signatures {
-		match, predicateType, err := matchPredicateType(signature, opts.PredicateType)
+		match, predicateType, err := matchType(signature, opts.Type)
 		if err != nil {
 			return nil, err
 		}
 
 		if !match {
-			logger.V(4).Info("predicateType doesn't match, continue", "expected", opts.PredicateType, "received", predicateType)
+			logger.V(4).Info("type doesn't match, continue", "expected", opts.Type, "received", predicateType)
 			continue
 		}
 
-		if err := matchSignatures([]oci.Signature{signature}, opts.Subject, opts.Issuer, opts.AdditionalExtensions); err != nil {
+		if err := matchSignatures([]oci.Signature{signature}, opts.Subject, opts.SubjectRegExp, opts.Issuer, opts.IssuerRegExp, opts.AdditionalExtensions); err != nil {
 			return nil, err
 		}
 	}
@@ -312,18 +357,18 @@ func FetchAttestations(ctx context.Context, rclient registryclient.Client, opts 
 		return nil, err
 	}
 
-	return &Response{Digest: digest, Statements: inTotoStatements}, nil
+	return &images.Response{Digest: digest, Statements: inTotoStatements}, nil
 }
 
-func matchPredicateType(sig oci.Signature, expectedPredicateType string) (bool, string, error) {
-	if expectedPredicateType != "" {
+func matchType(sig oci.Signature, expectedType string) (bool, string, error) {
+	if expectedType != "" {
 		statement, _, err := decodeStatement(sig)
 		if err != nil {
-			return false, "", fmt.Errorf("failed to decode predicateType: %w", err)
+			return false, "", fmt.Errorf("failed to decode type: %w", err)
 		}
 
-		if pType, ok := statement["predicateType"]; ok {
-			if pType.(string) == expectedPredicateType {
+		if pType, ok := statement["type"]; ok {
+			if pType.(string) == expectedType {
 				return true, pType.(string), nil
 			}
 		}
@@ -381,6 +426,7 @@ func decodeStatement(sig oci.Signature) (map[string]interface{}, string, error) 
 		if err != nil {
 			return nil, "", fmt.Errorf("failed to decode statement %s: %w", string(pld), err)
 		}
+		decodedStatement["type"] = decodedStatement["predicateType"]
 
 		return decodedStatement, digest, nil
 	}
@@ -392,12 +438,12 @@ func decodePayload(payloadBase64 string) (map[string]interface{}, error) {
 		return nil, fmt.Errorf("failed to base64 decode payload for %v: %w", statementRaw, err)
 	}
 
-	var statement in_toto.Statement
+	var statement in_toto.Statement //nolint:staticcheck
 	if err := json.Unmarshal(statementRaw, &statement); err != nil {
 		return nil, err
 	}
 
-	if statement.PredicateType != attestation.CosignCustomProvenanceV01 {
+	if statement.Type != attestation.CosignCustomProvenanceV01 {
 		// This assumes that the following statements are JSON objects:
 		// - in_toto.PredicateSLSAProvenanceV01
 		// - in_toto.PredicateLinkV1
@@ -409,8 +455,8 @@ func decodePayload(payloadBase64 string) (map[string]interface{}, error) {
 	return decodeCosignCustomProvenanceV01(statement)
 }
 
-func decodeCosignCustomProvenanceV01(statement in_toto.Statement) (map[string]interface{}, error) {
-	if statement.PredicateType != attestation.CosignCustomProvenanceV01 {
+func decodeCosignCustomProvenanceV01(statement in_toto.Statement) (map[string]interface{}, error) { //nolint:staticcheck
+	if statement.Type != attestation.CosignCustomProvenanceV01 {
 		return nil, fmt.Errorf("invalid statement type %s", attestation.CosignCustomProvenanceV01)
 	}
 
@@ -459,7 +505,7 @@ func decodePEM(raw []byte, signatureAlgorithm crypto.Hash) (signature.Verifier, 
 }
 
 func extractPayload(verified []oci.Signature) ([]payload.SimpleContainerImage, error) {
-	var sigPayloads []payload.SimpleContainerImage
+	sigPayloads := make([]payload.SimpleContainerImage, 0, len(verified))
 	for _, sig := range verified {
 		pld, err := sig.Payload()
 		if err != nil {
@@ -487,7 +533,7 @@ func extractDigest(imgRef string, payload []payload.SimpleContainerImage) (strin
 	return "", fmt.Errorf("digest not found for %s", imgRef)
 }
 
-func matchSignatures(signatures []oci.Signature, subject, issuer string, extensions map[string]string) error {
+func matchSignatures(signatures []oci.Signature, subject, subjectRegExp, issuer, issuerRegExp string, extensions map[string]string) error {
 	if subject == "" && issuer == "" && len(extensions) == 0 {
 		return nil
 	}
@@ -503,7 +549,7 @@ func matchSignatures(signatures []oci.Signature, subject, issuer string, extensi
 			return fmt.Errorf("certificate not found")
 		}
 
-		if err := matchCertificateData(cert, subject, issuer, extensions); err != nil {
+		if err := matchCertificateData(cert, subject, subjectRegExp, issuer, issuerRegExp, extensions); err != nil {
 			errs = append(errs, err)
 		} else {
 			// only one signature certificate needs to match the required subject, issuer, and extensions
@@ -519,28 +565,66 @@ func matchSignatures(signatures []oci.Signature, subject, issuer string, extensi
 	return fmt.Errorf("invalid signature")
 }
 
-func matchCertificateData(cert *x509.Certificate, subject, issuer string, extensions map[string]string) error {
-	if subject != "" {
-		s := sigs.CertSubject(cert)
-		if !wildcard.Match(subject, s) {
-			return fmt.Errorf("subject mismatch: expected %s, received %s", subject, s)
+func matchCertificateData(cert *x509.Certificate, subject, subjectRegExp, issuer, issuerRegExp string, extensions map[string]string) error {
+	if subject != "" || subjectRegExp != "" {
+		if sans := cryptoutils.GetSubjectAlternateNames(cert); len(sans) > 0 {
+			subjectMatched := false
+			if subject != "" {
+				for _, s := range sans {
+					if wildcard.Match(subject, s) {
+						subjectMatched = true
+						break
+					}
+				}
+			}
+			if subjectRegExp != "" {
+				regex, err := regexp.Compile(subjectRegExp)
+				if err != nil {
+					return fmt.Errorf("invalid regexp for subject: %s : %w", subjectRegExp, err)
+				}
+				for _, s := range sans {
+					if regex.MatchString(s) {
+						subjectMatched = true
+						break
+					}
+				}
+			}
+
+			if !subjectMatched {
+				sub := ""
+				if subject != "" {
+					sub = subject
+				} else if subjectRegExp != "" {
+					sub = subjectRegExp
+				}
+				return fmt.Errorf("subject mismatch: expected %s, received %s", sub, strings.Join(sans, ", "))
+			}
 		}
 	}
 
-	if err := matchExtensions(cert, issuer, extensions); err != nil {
+	if err := matchExtensions(cert, issuer, issuerRegExp, extensions); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func matchExtensions(cert *x509.Certificate, issuer string, extensions map[string]string) error {
+func matchExtensions(cert *x509.Certificate, issuer, issuerRegExp string, extensions map[string]string) error {
 	ce := cosign.CertExtensions{Cert: cert}
 
-	if issuer != "" {
+	if issuer != "" || issuerRegExp != "" {
 		val := ce.GetIssuer()
-		if !wildcard.Match(issuer, val) {
-			return fmt.Errorf("issuer mismatch: expected %s, received %s", issuer, val)
+		if issuer != "" {
+			if !wildcard.Match(issuer, val) {
+				return fmt.Errorf("issuer mismatch: expected %s, received %s", issuer, val)
+			}
+		}
+		if issuerRegExp != "" {
+			if regex, err := regexp.Compile(issuerRegExp); err != nil {
+				return fmt.Errorf("invalid regexp for issuer: %s : %w", issuerRegExp, err)
+			} else if !regex.MatchString(val) {
+				return fmt.Errorf("issuer mismatch: expected %s, received %s", issuerRegExp, val)
+			}
 		}
 	}
 
@@ -587,4 +671,50 @@ func checkAnnotations(payload []payload.SimpleContainerImage, annotations map[st
 		}
 	}
 	return nil
+}
+
+func getRekorPubs(ctx context.Context, rekorPubKey string) (*cosign.TrustedTransparencyLogPubKeys, error) {
+	if rekorPubKey == "" {
+		return cosign.GetRekorPubs(ctx)
+	}
+
+	publicKeys := cosign.NewTrustedTransparencyLogPubKeys()
+	if err := publicKeys.AddTransparencyLogPubKey([]byte(rekorPubKey), tuf.Active); err != nil {
+		return nil, fmt.Errorf("failed to get rekor public keys: %w", err)
+	}
+	return &publicKeys, nil
+}
+
+func getCTLogPubs(ctx context.Context, ctlogPubKey string) (*cosign.TrustedTransparencyLogPubKeys, error) {
+	if ctlogPubKey == "" {
+		return cosign.GetCTLogPubs(ctx)
+	}
+
+	publicKeys := cosign.NewTrustedTransparencyLogPubKeys()
+	if err := publicKeys.AddTransparencyLogPubKey([]byte(ctlogPubKey), tuf.Active); err != nil {
+		return nil, fmt.Errorf("failed to get transparency log public keys: %w", err)
+	}
+	return &publicKeys, nil
+}
+
+func splitPEMCertificateChain(pem []byte) (leaves, intermediates, roots []*x509.Certificate, err error) {
+	certs, err := cryptoutils.UnmarshalCertificatesFromPEM(pem)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	for _, cert := range certs {
+		if !cert.IsCA {
+			leaves = append(leaves, cert)
+		} else {
+			// root certificates are self-signed
+			if bytes.Equal(cert.RawSubject, cert.RawIssuer) {
+				roots = append(roots, cert)
+			} else {
+				intermediates = append(intermediates, cert)
+			}
+		}
+	}
+
+	return leaves, intermediates, roots, nil
 }

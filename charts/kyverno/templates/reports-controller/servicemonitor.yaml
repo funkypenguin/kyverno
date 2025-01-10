@@ -12,7 +12,7 @@ metadata:
   labels:
     {{- include "kyverno.reports-controller.labels" . | nindent 4 }}
     {{- with .Values.reportsController.serviceMonitor.additionalLabels }}
-    {{- toYaml .Values.reportsController.serviceMonitor.additionalLabels | nindent 4 }}
+    {{- toYaml . | nindent 4 }}
     {{- end }}
 spec:
   selector:
@@ -29,6 +29,14 @@ spec:
     scheme: https
     tlsConfig:
       {{- toYaml .Values.reportsController.serviceMonitor.tlsConfig | nindent 8 }}
+    {{- end }}
+    {{- with .Values.reportsController.serviceMonitor.relabelings }}
+    relabelings:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- with .Values.reportsController.serviceMonitor.metricRelabelings }}
+    metricRelabelings:
+      {{- toYaml . | nindent 6 }}
     {{- end }}
 {{- end -}}
 {{- end -}}

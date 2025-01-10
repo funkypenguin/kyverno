@@ -6,9 +6,10 @@ import (
 	"regexp"
 
 	"github.com/go-logr/logr"
-	kyvernov2alpha1 "github.com/kyverno/kyverno/api/kyverno/v2alpha1"
+	kyvernov2 "github.com/kyverno/kyverno/api/kyverno/v2"
 	"github.com/kyverno/kyverno/pkg/auth"
 	"github.com/kyverno/kyverno/pkg/clients/dclient"
+	"github.com/kyverno/kyverno/pkg/config"
 	enginecontext "github.com/kyverno/kyverno/pkg/engine/context"
 	"github.com/kyverno/kyverno/pkg/engine/variables"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -17,7 +18,7 @@ import (
 
 // FetchClusteredResources retieves the list of clustered resources
 func FetchClusteredResources(logger logr.Logger, client dclient.Interface) (sets.Set[string], error) {
-	res, err := discovery.ServerPreferredResources(client.Discovery().DiscoveryInterface())
+	res, err := discovery.ServerPreferredResources(client.Discovery().CachedDiscoveryInterface())
 	if err != nil {
 		if discovery.IsGroupDiscoveryFailedError(err) {
 			err := err.(*discovery.ErrGroupDiscoveryFailed)
@@ -32,6 +33,7 @@ func FetchClusteredResources(logger logr.Logger, client dclient.Interface) (sets
 	for _, resList := range res {
 		for _, r := range resList.APIResources {
 			if !r.Namespaced {
+				clusterResources.Insert(resList.GroupVersion + "/" + r.Kind)
 				clusterResources.Insert(r.Kind)
 			}
 		}
@@ -40,7 +42,7 @@ func FetchClusteredResources(logger logr.Logger, client dclient.Interface) (sets
 }
 
 // Validate checks policy is valid
-func Validate(ctx context.Context, logger logr.Logger, client dclient.Interface, policy kyvernov2alpha1.CleanupPolicyInterface) error {
+func Validate(ctx context.Context, logger logr.Logger, client dclient.Interface, policy kyvernov2.CleanupPolicyInterface) error {
 	clusteredResources, err := FetchClusteredResources(logger, client)
 	if err != nil {
 		return err
@@ -59,39 +61,55 @@ func Validate(ctx context.Context, logger logr.Logger, client dclient.Interface,
 }
 
 // validatePolicy checks the policy and rules declarations for required configurations
-func validatePolicy(clusterResources sets.Set[string], policy kyvernov2alpha1.CleanupPolicyInterface) error {
+func validatePolicy(clusterResources sets.Set[string], policy kyvernov2.CleanupPolicyInterface) error {
 	errs := policy.Validate(clusterResources)
 	return errs.ToAggregate()
 }
 
 // validateAuth checks the the delete action is allowed
-func validateAuth(ctx context.Context, client dclient.Interface, policy kyvernov2alpha1.CleanupPolicyInterface) error {
+func validateAuth(ctx context.Context, client dclient.Interface, policy kyvernov2.CleanupPolicyInterface) error {
 	namespace := policy.GetNamespace()
 	spec := policy.GetSpec()
-	kinds := sets.New(spec.MatchResources.GetKinds()...)
-	for kind := range kinds {
-		checker := auth.NewCanI(client.Discovery(), client.GetKubeClient().AuthorizationV1().SelfSubjectAccessReviews(), kind, namespace, "delete", "")
-		allowedDeletion, err := checker.RunAccessCheck(ctx)
-		if err != nil {
-			return err
-		}
-		if !allowedDeletion {
-			return fmt.Errorf("cleanup controller has no permission to delete kind %s", kind)
-		}
-
-		checker = auth.NewCanI(client.Discovery(), client.GetKubeClient().AuthorizationV1().SelfSubjectAccessReviews(), kind, namespace, "list", "")
-		allowedList, err := checker.RunAccessCheck(ctx)
-		if err != nil {
-			return err
-		}
-		if !allowedList {
-			return fmt.Errorf("cleanup controller has no permission to list kind %s", kind)
+	resourceFilters := spec.MatchResources.GetResourceFilters()
+	for _, res := range resourceFilters {
+		for _, kind := range res.Kinds {
+			names := res.Names
+			if len(names) == 0 {
+				names = append(names, "")
+			}
+			for _, name := range names {
+				err := canI(ctx, client, kind, namespace, name, "")
+				if err != nil {
+					return err
+				}
+			}
 		}
 	}
 	return nil
 }
 
-func validateVariables(logger logr.Logger, policy kyvernov2alpha1.CleanupPolicyInterface) error {
+func canI(ctx context.Context, client dclient.Interface, kind, namespace, name, subresource string) error {
+	checker := auth.NewCanI(client.Discovery(), client.GetKubeClient().AuthorizationV1().SubjectAccessReviews(), kind, namespace, name, "delete", subresource, config.KyvernoUserName(config.KyvernoServiceAccountName()))
+	allowedDeletion, _, err := checker.RunAccessCheck(ctx)
+	if err != nil {
+		return err
+	}
+	if !allowedDeletion {
+		return fmt.Errorf("cleanup controller has no permission to delete kind %s", kind)
+	}
+
+	checker = auth.NewCanI(client.Discovery(), client.GetKubeClient().AuthorizationV1().SubjectAccessReviews(), kind, namespace, name, "list", subresource, config.KyvernoUserName(config.KyvernoServiceAccountName()))
+	allowedList, _, err := checker.RunAccessCheck(ctx)
+	if err != nil {
+		return err
+	}
+	if !allowedList {
+		return fmt.Errorf("cleanup controller has no permission to list kind %s", kind)
+	}
+	return nil
+}
+
+func validateVariables(logger logr.Logger, policy kyvernov2.CleanupPolicyInterface) error {
 	ctx := enginecontext.NewMockContext(allowedVariables)
 
 	c := policy.GetSpec().Conditions
@@ -102,4 +120,4 @@ func validateVariables(logger logr.Logger, policy kyvernov2alpha1.CleanupPolicyI
 	return nil
 }
 
-var allowedVariables = regexp.MustCompile(`target\.|images\.|([a-z_0-9]+\()[^{}]`)
+var allowedVariables = regexp.MustCompile(`([a-z_0-9]+)|(target\.|images\.|([a-z_0-9]+\()[^{}])`)

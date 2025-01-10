@@ -1,35 +1,28 @@
 package match
 
 import (
-	"golang.org/x/exp/slices"
+	"github.com/kyverno/kyverno/ext/wildcard"
 	authenticationv1 "k8s.io/api/authentication/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 )
 
 // CheckSubjects return true if one of ruleSubjects exist in userInfo
-func CheckSubjects(
-	ruleSubjects []rbacv1.Subject,
-	userInfo authenticationv1.UserInfo,
-	excludeGroupRole []string,
-) bool {
-	const SaPrefix = "system:serviceaccount:"
-	userGroups := append(userInfo.Groups, userInfo.Username)
-	// TODO: see issue https://github.com/kyverno/kyverno/issues/861
-	for _, e := range excludeGroupRole {
-		ruleSubjects = append(ruleSubjects, rbacv1.Subject{Kind: "Group", Name: e})
-	}
+func CheckSubjects(ruleSubjects []rbacv1.Subject, userInfo authenticationv1.UserInfo) bool {
 	for _, subject := range ruleSubjects {
 		switch subject.Kind {
-		case "ServiceAccount":
-			if len(userInfo.Username) <= len(SaPrefix) {
-				continue
-			}
-			subjectServiceAccount := subject.Namespace + ":" + subject.Name
-			if userInfo.Username[len(SaPrefix):] == subjectServiceAccount {
+		case rbacv1.ServiceAccountKind:
+			username := "system:serviceaccount:" + subject.Namespace + ":" + subject.Name
+			if wildcard.Match(username, userInfo.Username) {
 				return true
 			}
-		case "User", "Group":
-			if slices.Contains(userGroups, subject.Name) {
+		case rbacv1.GroupKind:
+			for _, group := range userInfo.Groups {
+				if wildcard.Match(subject.Name, group) {
+					return true
+				}
+			}
+		case rbacv1.UserKind:
+			if wildcard.Match(subject.Name, userInfo.Username) {
 				return true
 			}
 		}

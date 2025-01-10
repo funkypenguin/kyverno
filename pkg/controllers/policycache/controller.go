@@ -6,14 +6,12 @@ import (
 
 	"github.com/go-logr/logr"
 	kyvernov1 "github.com/kyverno/kyverno/api/kyverno/v1"
-	"github.com/kyverno/kyverno/pkg/autogen"
 	kyvernov1informers "github.com/kyverno/kyverno/pkg/client/informers/externalversions/kyverno/v1"
 	kyvernov1listers "github.com/kyverno/kyverno/pkg/client/listers/kyverno/v1"
 	"github.com/kyverno/kyverno/pkg/clients/dclient"
 	"github.com/kyverno/kyverno/pkg/controllers"
 	pcache "github.com/kyverno/kyverno/pkg/policycache"
 	controllerutils "github.com/kyverno/kyverno/pkg/utils/controller"
-	kubeutils "github.com/kyverno/kyverno/pkg/utils/kube"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -41,7 +39,7 @@ type controller struct {
 	polLister  kyvernov1listers.PolicyLister
 
 	// queue
-	queue workqueue.RateLimitingInterface
+	queue workqueue.TypedRateLimitingInterface[any]
 
 	// client
 	client dclient.Interface
@@ -52,11 +50,18 @@ func NewController(client dclient.Interface, pcache pcache.Cache, cpolInformer k
 		cache:      pcache,
 		cpolLister: cpolInformer.Lister(),
 		polLister:  polInformer.Lister(),
-		queue:      workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), ControllerName),
-		client:     client,
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[any](),
+			workqueue.TypedRateLimitingQueueConfig[any]{Name: ControllerName},
+		),
+		client: client,
 	}
-	controllerutils.AddDefaultEventHandlers(logger, cpolInformer.Informer(), c.queue)
-	controllerutils.AddDefaultEventHandlers(logger, polInformer.Informer(), c.queue)
+	if _, _, err := controllerutils.AddDefaultEventHandlers(logger, cpolInformer.Informer(), c.queue); err != nil {
+		logger.Error(err, "failed to register event handlers")
+	}
+	if _, _, err := controllerutils.AddDefaultEventHandlers(logger, polInformer.Informer(), c.queue); err != nil {
+		logger.Error(err, "failed to register event handlers")
+	}
 	return &c
 }
 
@@ -72,8 +77,12 @@ func (c *controller) WarmUp() error {
 		if key, err := cache.MetaNamespaceKeyFunc(policy); err != nil {
 			return err
 		} else {
-			subresourceGVKToKind := getSubresourceGVKToKindMap(policy, c.client)
-			c.cache.Set(key, policy, subresourceGVKToKind)
+			if policy.IsReady() {
+				return c.cache.Set(key, policy, c.client.Discovery())
+			} else {
+				c.cache.Unset(key)
+				return nil
+			}
 		}
 	}
 	cpols, err := c.cpolLister.List(labels.Everything())
@@ -84,8 +93,12 @@ func (c *controller) WarmUp() error {
 		if key, err := cache.MetaNamespaceKeyFunc(policy); err != nil {
 			return err
 		} else {
-			subresourceGVKToKind := getSubresourceGVKToKindMap(policy, c.client)
-			c.cache.Set(key, policy, subresourceGVKToKind)
+			if policy.IsReady() {
+				return c.cache.Set(key, policy, c.client.Discovery())
+			} else {
+				c.cache.Unset(key)
+				return nil
+			}
 		}
 	}
 	return nil
@@ -103,10 +116,17 @@ func (c *controller) reconcile(ctx context.Context, logger logr.Logger, key, nam
 		}
 		return err
 	}
-	// TODO: check resource version ?
-	subresourceGVKToKind := getSubresourceGVKToKindMap(policy, c.client)
-	c.cache.Set(key, policy, subresourceGVKToKind)
-	return nil
+	if policy.AdmissionProcessingEnabled() && !policy.GetSpec().CustomWebhookMatchConditions() {
+		if policy.IsReady() {
+			return c.cache.Set(key, policy, c.client.Discovery())
+		} else {
+			c.cache.Unset(key)
+			return nil
+		}
+	} else {
+		c.cache.Unset(key)
+		return nil
+	}
 }
 
 func (c *controller) loadPolicy(namespace, name string) (kyvernov1.PolicyInterface, error) {
@@ -115,19 +135,4 @@ func (c *controller) loadPolicy(namespace, name string) (kyvernov1.PolicyInterfa
 	} else {
 		return c.polLister.Policies(namespace).Get(name)
 	}
-}
-
-func getSubresourceGVKToKindMap(policy kyvernov1.PolicyInterface, client dclient.Interface) map[string]string {
-	subresourceGVKToKind := make(map[string]string)
-	for _, rule := range autogen.ComputeRules(policy) {
-		for _, gvk := range rule.MatchResources.GetKinds() {
-			gv, k := kubeutils.GetKindFromGVK(gvk)
-			_, subresource := kubeutils.SplitSubresource(k)
-			if subresource != "" {
-				apiResource, _, _, _ := client.Discovery().FindResource(gv, k)
-				subresourceGVKToKind[gvk] = apiResource.Kind
-			}
-		}
-	}
-	return subresourceGVKToKind
 }

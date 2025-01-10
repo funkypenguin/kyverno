@@ -249,7 +249,7 @@ func TestValidateMap_AsteriskForMap(t *testing.T) {
 					"containers":[
 						{
 							"name":"nginxo",
-							"image":"k8s.gcr.io/nginx-but-no-slim:0.8",
+							"image":"registry.k8s.io/nginx-but-no-slim:0.8",
 							"ports":[
 								{
 									"containerPort":8780,
@@ -337,7 +337,7 @@ func TestValidateMap_AsteriskForArray(t *testing.T) {
 					"containers":[
 						{
 							"name":"nginxo",
-							"image":"k8s.gcr.io/nginx-but-no-slim:0.8",
+							"image":"registry.k8s.io/nginx-but-no-slim:0.8",
 							"ports":[
 								{
 									"containerPort":8780,
@@ -430,7 +430,7 @@ func TestValidateMap_AsteriskFieldIsMissing(t *testing.T) {
 					"containers":[
 						{
 							"name":"nginxo",
-							"image":"k8s.gcr.io/nginx-but-no-slim:0.8",
+							"image":"registry.k8s.io/nginx-but-no-slim:0.8",
 							"ports":[
 								{
 									"containerPort":8780,
@@ -521,7 +521,7 @@ func TestValidateMap_livenessProbeIsNull(t *testing.T) {
 					"containers":[
 						{
 							"name":"nginxo",
-							"image":"k8s.gcr.io/nginx-but-no-slim:0.8",
+							"image":"registry.k8s.io/nginx-but-no-slim:0.8",
 							"ports":[
 								{
 									"containerPort":8780,
@@ -613,7 +613,7 @@ func TestValidateMap_livenessProbeIsMissing(t *testing.T) {
 					"containers":[
 						{
 							"name":"nginxo",
-							"image":"k8s.gcr.io/nginx-but-no-slim:0.8",
+							"image":"registry.k8s.io/nginx-but-no-slim:0.8",
 							"ports":[
 								{
 									"containerPort":8780,
@@ -1613,6 +1613,78 @@ func TestConditionalAnchorWithMultiplePatterns(t *testing.T) {
 			name:     "test-42",
 			pattern:  []byte(`{"metadata": {"labels": {"allow-docker": "true"}},"(spec)": {"(volumes)": [{"(hostPath)": {"path": "/var/run/docker.sock"}}]}}`),
 			resource: []byte(`{"metadata": {"labels": {"run": "nginx"},"name": "nginx"},"spec": {"containers": [{"image": "nginx","name": "nginx"}],"volumes": [{"hostPath": {"path": "/var/run/docker.sock"}}]}}`),
+			status:   engineapi.RuleStatusFail,
+		},
+		{
+			name:     "test-43",
+			pattern:  []byte(`{"spec": {"=(volumes)": [{"(name)": "!cache-volume","=(emptyDir)": {"sizeLimit": "?*"}}]}}`),
+			resource: []byte(`{"spec": {"volumes": [{"name": "cache-volume","emptyDir": {}}]}}`),
+			status:   engineapi.RuleStatusSkip,
+		},
+		{
+			name:     "test-44",
+			pattern:  []byte(`{"spec": {"=(initContainers)": [{"(name)": "!istio-init", "=(securityContext)": {"=(runAsUser)": ">0"}}], "=(containers)": [{"=(securityContext)": {"=(runAsUser)": ">0"}}]}}`),
+			resource: []byte(`{"spec": {"initContainers": [{"name": "nginx", "securityContext": {"runAsUser": 1000}}], "containers": [{"name": "nginx", "image": "nginx"}]}}`),
+			status:   engineapi.RuleStatusPass,
+		},
+		{
+			name:     "test-45",
+			pattern:  []byte(`{"spec": {"=(initContainers)": [{"(name)": "!istio-init", "=(securityContext)": {"=(runAsUser)": ">0"}}], "=(containers)": [{"=(securityContext)": {"=(runAsUser)": ">0"}}]}}`),
+			resource: []byte(`{"spec": {"initContainers": [{"name": "nginx", "securityContext": {"runAsUser": 0}}], "containers": [{"name": "nginx", "image": "nginx"}]}}`),
+			status:   engineapi.RuleStatusFail,
+		},
+		{
+			name:     "test-46",
+			pattern:  []byte(`{"spec": {"=(initContainers)": [{"(name)": "!istio-init", "=(securityContext)": {"=(runAsUser)": ">0"}}], "=(containers)": [{"=(securityContext)": {"=(runAsUser)": ">0"}}]}}`),
+			resource: []byte(`{"spec": {"initContainers": [{"name": "istio-init", "securityContext": {"runAsUser": 0}}], "containers": [{"securityContext": {"runAsUser": 1000}}]}}`),
+			status:   engineapi.RuleStatusPass,
+		},
+		{
+			name:     "test-47",
+			pattern:  []byte(`{"spec": {"=(initContainers)": [{"(name)": "!istio-init", "=(securityContext)": {"=(runAsUser)": ">0"}}], "=(containers)": [{"=(securityContext)": {"=(runAsUser)": ">0"}}]}}`),
+			resource: []byte(`{"spec": {"initContainers": [{"name": "istio-init", "securityContext": {"runAsUser": 1000}}], "containers": [{"securityContext": {"runAsUser": 0}}]}}`),
+			status:   engineapi.RuleStatusFail,
+		},
+		{
+			name:     "test-48",
+			pattern:  []byte(`{"spec": {"=(initContainers)": [{"(name)": "!istio-init", "=(securityContext)": {"=(runAsUser)": ">0"}}], "=(containers)": [{"=(securityContext)": {"=(runAsUser)": ">0"}}]}}`),
+			resource: []byte(`{"spec": {"containers": [{"securityContext": {"runAsUser": 1000}}]}}`),
+			status:   engineapi.RuleStatusPass,
+		},
+		{
+			name:     "test-49",
+			pattern:  []byte(`{"spec": {"=(initContainers)": [{"(name)": "!istio-init", "=(securityContext)": {"=(runAsUser)": ">0"}}], "=(containers)": [{"=(securityContext)": {"=(runAsUser)": ">0"}}]}}`),
+			resource: []byte(`{"spec": {"containers": [{"securityContext": {"runAsUser": 0}}]}}`),
+			status:   engineapi.RuleStatusFail,
+		},
+		{
+			name:     "test-50",
+			pattern:  []byte(`{"spec": {"=(initContainers)": [{"(name)": "!istio-init", "=(securityContext)": {"=(runAsUser)": ">0"}}], "=(containers)": [{"=(securityContext)": {"=(runAsUser)": ">0"}}]}}`),
+			resource: []byte(`{"spec": {"initContainers": [{"name": "istio-init", "securityContext": {"runAsUser": 0}}], "containers": [{"name": "nginx", "image": "nginx"}]}}`),
+			status:   engineapi.RuleStatusPass,
+		},
+		{
+			name:     "test-51",
+			pattern:  []byte(`{"spec": {"=(volumes)": [{"(name)": "!credential-socket&!istio-data&!istio-envoy&!workload-certs&!workload-socket","=(emptyDir)": {"sizeLimit": "?*"}}]}}`),
+			resource: []byte(`{"spec": {"volumes": [{"name": "credential-socket","emptyDir": {"sizeLimit": "1Gi"}}]}}`),
+			status:   engineapi.RuleStatusSkip,
+		},
+		{
+			name:     "test-52",
+			pattern:  []byte(`{"spec": {"=(volumes)": [{"(name)": "!credential-socket&!istio-data&!istio-envoy&!workload-certs&!workload-socket","=(emptyDir)": {"sizeLimit": "?*"}}]}}`),
+			resource: []byte(`{"spec": {"volumes": [{"name": "cache-volume","emptyDir": {"sizeLimit": "1Gi"}}]}}`),
+			status:   engineapi.RuleStatusPass,
+		},
+		{
+			name:     "test-53",
+			pattern:  []byte(`{"spec": {"=(volumes)": [{"(name)": "!credential-socket&!istio-data&!istio-envoy&!workload-certs&!workload-socket","=(emptyDir)": {"sizeLimit": "?*"}}]}}`),
+			resource: []byte(`{"spec": {"volumes": [{"name": "cache-volume"}]}}`),
+			status:   engineapi.RuleStatusPass,
+		},
+		{
+			name:     "test-54",
+			pattern:  []byte(`{"spec": {"=(volumes)": [{"(name)": "!credential-socket&!istio-data&!istio-envoy&!workload-certs&!workload-socket","=(emptyDir)": {"sizeLimit": "?*"}}]}}`),
+			resource: []byte(`{"spec": {"volumes": [{"name": "cache-volume","emptyDir": {}}]}}`),
 			status:   engineapi.RuleStatusFail,
 		},
 	}

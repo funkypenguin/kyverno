@@ -12,15 +12,15 @@ import (
 type UserInfo struct {
 	// Roles is the list of namespaced role names for the user.
 	// +optional
-	Roles []string `json:"roles,omitempty" yaml:"roles,omitempty"`
+	Roles []string `json:"roles,omitempty"`
 
 	// ClusterRoles is the list of cluster-wide role names for the user.
 	// +optional
-	ClusterRoles []string `json:"clusterRoles,omitempty" yaml:"clusterRoles,omitempty"`
+	ClusterRoles []string `json:"clusterRoles,omitempty"`
 
 	// Subjects is the list of subject names like users, user groups, and service accounts.
 	// +optional
-	Subjects []rbacv1.Subject `json:"subjects,omitempty" yaml:"subjects,omitempty"`
+	Subjects []rbacv1.Subject `json:"subjects,omitempty"`
 }
 
 func (r UserInfo) IsEmpty() bool {
@@ -35,6 +35,8 @@ func (u *UserInfo) ValidateSubjects(path *field.Path) (errs field.ErrorList) {
 		entry := path.Index(index)
 		if subject.Kind == "" {
 			errs = append(errs, field.Required(entry.Child("kind"), ""))
+		} else if subject.Kind != rbacv1.GroupKind && subject.Kind != rbacv1.ServiceAccountKind && subject.Kind != rbacv1.UserKind {
+			errs = append(errs, field.Invalid(entry.Child("kind"), subject.Kind, "kind must be 'User', 'Group', or 'ServiceAccount'"))
 		}
 		if subject.Name == "" {
 			errs = append(errs, field.Required(entry.Child("name"), ""))

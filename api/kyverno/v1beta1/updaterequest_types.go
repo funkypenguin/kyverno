@@ -25,20 +25,21 @@ import (
 
 // UpdateRequestStatus defines the observed state of UpdateRequest
 type UpdateRequestStatus struct {
-	// Handler represents the instance ID that handles the UR
 	// Deprecated
-	Handler string `json:"handler,omitempty" yaml:"handler,omitempty"`
+	Handler string `json:"handler,omitempty"`
 
 	// State represents state of the update request.
-	State UpdateRequestState `json:"state" yaml:"state"`
+	State UpdateRequestState `json:"state"`
 
 	// Specifies request status message.
 	// +optional
-	Message string `json:"message,omitempty" yaml:"message,omitempty"`
+	Message string `json:"message,omitempty"`
 
 	// This will track the resources that are updated by the generate Policy.
 	// Will be used during clean up resources.
-	GeneratedResources []kyvernov1.ResourceSpec `json:"generatedResources,omitempty" yaml:"generatedResources,omitempty"`
+	GeneratedResources []kyvernov1.ResourceSpec `json:"generatedResources,omitempty"`
+
+	RetryCount int `json:"retryCount,omitempty"`
 }
 
 // +genclient
@@ -46,6 +47,7 @@ type UpdateRequestStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Policy",type="string",JSONPath=".spec.policy"
+// +kubebuilder:printcolumn:name="Rule",type="string",JSONPath=".spec.rule"
 // +kubebuilder:printcolumn:name="RuleType",type="string",JSONPath=".spec.requestType"
 // +kubebuilder:printcolumn:name="ResourceKind",type="string",JSONPath=".spec.resource.kind"
 // +kubebuilder:printcolumn:name="ResourceName",type="string",JSONPath=".spec.resource.name"
@@ -53,13 +55,14 @@ type UpdateRequestStatus struct {
 // +kubebuilder:printcolumn:name="status",type="string",JSONPath=".status.state"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 // +kubebuilder:resource:shortName=ur,categories=kyverno
+// +kubebuilder:deprecatedversion
 
 // UpdateRequest is a request to process mutate and generate rules in background.
 type UpdateRequest struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	// Spec is the information to identify the update request.
+	// ResourceSpec is the information to identify the trigger resource.
 	Spec UpdateRequestSpec `json:"spec,omitempty"`
 
 	// Status contains statistics related to update request.
@@ -78,31 +81,34 @@ const (
 type UpdateRequestSpec struct {
 	// Type represents request type for background processing
 	// +kubebuilder:validation:Enum=mutate;generate
-	Type RequestType `json:"requestType,omitempty" yaml:"requestType,omitempty"`
+	Type RequestType `json:"requestType,omitempty"`
 
 	// Specifies the name of the policy.
-	Policy string `json:"policy" yaml:"policy"`
+	Policy string `json:"policy"`
 
 	// Rule is the associate rule name of the current UR.
-	Rule string `json:"rule" yaml:"rule"`
+	Rule string `json:"rule"`
+
+	// DeleteDownstream represents whether the downstream needs to be deleted.
+	DeleteDownstream bool `json:"deleteDownstream"`
 
 	// Synchronize represents the sync behavior of the corresponding rule
 	// Optional. Defaults to "false" if not specified.
-	Synchronize bool `json:"synchronize,omitempty" yaml:"synchronize,omitempty"`
+	Synchronize bool `json:"synchronize,omitempty"`
 
-	// ResourceSpec is the information to identify the update request.
-	Resource kyvernov1.ResourceSpec `json:"resource" yaml:"resource"`
+	// ResourceSpec is the information to identify the trigger resource.
+	Resource kyvernov1.ResourceSpec `json:"resource"`
 
 	// Context ...
-	Context UpdateRequestSpecContext `json:"context" yaml:"context"`
+	Context UpdateRequestSpecContext `json:"context"`
 }
 
 // UpdateRequestSpecContext stores the context to be shared.
 type UpdateRequestSpecContext struct {
 	// +optional
-	UserRequestInfo RequestInfo `json:"userInfo,omitempty" yaml:"userInfo,omitempty"`
+	UserRequestInfo RequestInfo `json:"userInfo,omitempty"`
 	// +optional
-	AdmissionRequestInfo AdmissionRequestInfoObject `json:"admissionRequestInfo,omitempty" yaml:"admissionRequestInfo,omitempty"`
+	AdmissionRequestInfo AdmissionRequestInfoObject `json:"admissionRequestInfo,omitempty"`
 }
 
 // RequestInfo contains permission info carried in an admission request.
@@ -110,24 +116,24 @@ type RequestInfo struct {
 	// Roles is a list of possible role send the request.
 	// +nullable
 	// +optional
-	Roles []string `json:"roles" yaml:"roles"`
+	Roles []string `json:"roles,omitempty"`
 
 	// ClusterRoles is a list of possible clusterRoles send the request.
 	// +nullable
 	// +optional
-	ClusterRoles []string `json:"clusterRoles" yaml:"clusterRoles"`
+	ClusterRoles []string `json:"clusterRoles,omitempty"`
 
 	// UserInfo is the userInfo carried in the admission request.
 	// +optional
-	AdmissionUserInfo authenticationv1.UserInfo `json:"userInfo" yaml:"userInfo"`
+	AdmissionUserInfo authenticationv1.UserInfo `json:"userInfo"`
 }
 
 // AdmissionRequestInfoObject stores the admission request and operation details
 type AdmissionRequestInfoObject struct {
 	// +optional
-	AdmissionRequest *admissionv1.AdmissionRequest `json:"admissionRequest,omitempty" yaml:"admissionRequest,omitempty"`
+	AdmissionRequest *admissionv1.AdmissionRequest `json:"admissionRequest,omitempty"`
 	// +optional
-	Operation admissionv1.Operation `json:"operation,omitempty" yaml:"operation,omitempty"`
+	Operation admissionv1.Operation `json:"operation,omitempty"`
 }
 
 // UpdateRequestState defines the state of request.
@@ -147,7 +153,8 @@ const (
 	Skip UpdateRequestState = "Skip"
 )
 
-//+kubebuilder:object:root=true
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+// +kubebuilder:object:root=true
 
 // UpdateRequestList contains a list of UpdateRequest
 type UpdateRequestList struct {

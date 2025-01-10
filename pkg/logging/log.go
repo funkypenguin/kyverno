@@ -8,13 +8,12 @@ import (
 	stdlog "log"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
-	"github.com/go-logr/zapr"
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
+	"github.com/go-logr/zerologr"
+	"github.com/rs/zerolog"
 	"k8s.io/klog/v2"
-	"k8s.io/klog/v2/klogr"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -25,16 +24,25 @@ const (
 	// Default logging mode is TextFormat.
 	TextFormat = "text"
 	// LogLevelController is the log level to use for controllers plumbing.
-	LogLevelController = 3
+	LogLevelController = 1
 	// LogLevelClient is the log level to use for clients.
-	LogLevelClient = 3
+	LogLevelClient = 1
+	// time formats
+	DefaultTime = "default"
+	ISO8601     = "iso8601"
+	RFC3339     = "rfc3339"
+	MILLIS      = "millis"
+	NANOS       = "nanos"
+	EPOCH       = "epoch"
+	RFC3339NANO = "rfc3339nano"
 )
 
 // Initially, globalLog comes from controller-runtime/log with logger created earlier by controller-runtime.
 // When logging.Setup is called, globalLog is switched to the real logger.
 // Call depth of all loggers created before logging.Setup will not work, including package level loggers as they are created before main.
 // All loggers created after logging.Setup won't be subject to the call depth limitation and will work if the underlying sink supports it.
-var globalLog = log.Log
+
+var globalLog = log.Log // returns a Null log sink if SetLogger is not called.
 
 func InitFlags(flags *flag.FlagSet) {
 	// clear flags initialized in static dependencies
@@ -46,27 +54,44 @@ func InitFlags(flags *flag.FlagSet) {
 
 // Setup configures the logger with the supplied log format.
 // It returns an error if the JSON logger could not be initialized or passed logFormat is not recognized.
-func Setup(logFormat string, level int) error {
+func Setup(logFormat string, loggingTimestampFormat string, level int) error {
+	zerologr.SetMaxV(level)
+
+	var logger zerolog.Logger
 	switch logFormat {
 	case TextFormat:
-		// in text mode we use FormatSerialize format
-		globalLog = klogr.New()
+		output := zerolog.ConsoleWriter{Out: os.Stderr}
+		output.TimeFormat = resolveTimestampFormat(loggingTimestampFormat)
+		logger = zerolog.New(output).With().Timestamp().Caller().Logger()
 	case JSONFormat:
-		zc := zap.NewProductionConfig()
-		// Zap's levels get more and less verbose as the number gets smaller and higher respectively (DebugLevel is -1, InfoLevel is 0, WarnLevel is 1, and so on).
-		zc.Level = zap.NewAtomicLevelAt(zapcore.Level(-1 * level))
-		zapLog, err := zc.Build()
-		if err != nil {
-			return err
-		}
-		globalLog = zapr.NewLogger(zapLog)
-		// in json mode we configure klog and global logger to use zapr
-		klog.SetLogger(globalLog.WithName("klog"))
+		logger = zerolog.New(os.Stderr).With().Timestamp().Logger()
 	default:
 		return errors.New("log format not recognized, pass `text` for text mode or `json` to enable JSON logging")
 	}
+
+	globalLog = zerologr.New(&logger)
+	klog.SetLogger(globalLog.WithName("klog"))
 	log.SetLogger(globalLog)
 	return nil
+}
+
+func resolveTimestampFormat(format string) string {
+	switch format {
+	case ISO8601:
+		return time.RFC3339
+	case RFC3339:
+		return time.RFC3339
+	case MILLIS:
+		return time.StampMilli
+	case NANOS:
+		return time.StampNano
+	case EPOCH:
+		return time.UnixDate
+	case RFC3339NANO:
+		return time.RFC3339Nano
+	default:
+		return time.RFC3339
+	}
 }
 
 // GlobalLogger returns a logr.Logger as configured in main.
