@@ -3,10 +3,10 @@
 {{- define "kyverno.labels.merge" -}}
 {{- $labels := dict -}}
 {{- range . -}}
-    {{- $labels = merge $labels (fromYaml .) -}}
+  {{- $labels = merge $labels (fromYaml .) -}}
 {{- end -}}
 {{- with $labels -}}
-    {{- toYaml $labels -}}
+  {{- toYaml $labels -}}
 {{- end -}}
 {{- end -}}
 
@@ -22,12 +22,16 @@ app.kubernetes.io/version: {{ template "kyverno.chartVersion" . }}
 {{- end -}}
 
 {{- define "kyverno.labels.common" -}}
-{{- template "kyverno.labels.merge" (list (include "kyverno.labels.helm" .) (include "kyverno.labels.version" .)) -}}
+{{- template "kyverno.labels.merge" (list
+  (include "kyverno.labels.helm" .)
+  (include "kyverno.labels.version" .)
+  (toYaml .Values.customLabels)
+) -}}
 {{- end -}}
 
 {{- define "kyverno.matchLabels.common" -}}
 app.kubernetes.io/part-of: {{ template "kyverno.fullname" . }}
-app.kubernetes.io/instance: {{ template "kyverno.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
 {{- define "kyverno.labels.component" -}}

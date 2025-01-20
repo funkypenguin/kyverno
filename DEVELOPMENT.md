@@ -4,6 +4,7 @@ This document covers basic needs to work with Kyverno codebase.
 
 It contains instructions to build, run, and test Kyverno.
 
+- [Open project in devcontainer](#open-project-in-devcontainer-recommended)
 - [Tools](#tools)
 - [Building local binaries](#building-local-binaries)
   - [Building kyvernopre locally](#building-kyvernopre-locally)
@@ -26,6 +27,35 @@ It contains instructions to build, run, and test Kyverno.
   - [Generating helm charts CRDs](#generating-helm-charts-crds)
   - [Generating helm charts docs](#generating-helm-charts-docs)
 - [Debugging local code](#debugging-local-code)
+- [Profiling](#profiling)
+- [API Design](#api-design)
+- [Controllers Design](#controllers-design)
+- [Logging](#logging)
+- [Feature Flags](#feature-flags)
+- [Reports Design](#reports-design)
+- [Troubleshooting](#troubleshooting)
+- [Selecting Issues](#selecting-issues)
+
+
+## Open project in devcontainer (recommended)
+- Clone the project to your local machine.
+- Make sure that you have the Visual Studio Code editor installed on your system.
+
+- Make sure that you have wsl(Ubuntu preferred) and Docker installed on your system and on wsl too (docker.sock (UNIX socket) file is necessary to enable devcontainer to communicate with docker running in host machine).
+
+- Open the project in Visual Studio Code, once the project is opened hit F1 and type wsl, now click on "Reopen in WSL".
+
+- If you haven't already done so, install the **Dev Containers** extension in Visual Studio Code.
+
+- Once the extension is installed, you should see a green icon in the bottom left corner of the window.
+
+- After you have installed Dev Containers extension, it should automatically detect the .devcontainer folder inside the project opened in wsl, and should suggest you to open the project in container.
+
+- If it doesn't suggest you, then press <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>p</kbd> and search "reopen in container" and click on it.
+
+- If everything goes well, the project should be opened in your devcontainer.
+
+- Then follow the steps as mentioned below to configure the project.
 
 ## Tools
 
@@ -221,7 +251,7 @@ To create a local KinD cluster, run:
 make kind-create-cluster
 ```
 
-You can override the k8s version by setting the `KIND_IMAGE` environment variable (default value is `kindest/node:v1.24.0`).
+You can override the k8s version by setting the `KIND_IMAGE` environment variable (default value is `kindest/node:v1.29.1`).
 
 You can also override the KinD cluster name by setting the `KIND_NAME` environment variable (default value is `kind`).
 
@@ -392,13 +422,129 @@ You can run Kyverno locally or in your IDE of choice with a few steps:
 1. Deploy Kyverno manifests except the Kyverno `Deployment`
     - Kyverno is going to run on your local machine, so it should not run in cluster at the same time
     - You can deploy the manifests by running `make debug-deploy`
+1. There are multiple environment variables that need to be configured. The variables can be found in [here](./.vscode/launch.json). Their values can be set using the command `export $NAME=value`
 1. To run Kyverno locally against the remote cluster you will need to provide `--kubeconfig` and `--serverIP` arguments:
     - `--kubeconfig` must point to your kubeconfig file (usually `~/.kube/config`)
     - `--serverIP` must be set to `<local ip>:9443` (`<local ip>` is the private ip adress of your local machine)
+    - `--backgroundServiceAccountName` must be set to `system:serviceaccount:kyverno:kyverno-background-controller`
+    - `--caSecretName` must be set to `kyverno-svc.kyverno.svc.kyverno-tls-ca`
+    - `--tlsSecretName` must be set to `kyverno-svc.kyverno.svc.kyverno-tls-pair`
 
 Once you are ready with the steps above, Kyverno can be started locally with:
 ```console
-go run ./cmd/kyverno/ --kubeconfig ~/.kube/config --serverIP=<local-ip>:9443
+go run ./cmd/kyverno/ --kubeconfig ~/.kube/config --serverIP=<local-ip>:9443 --backgroundServiceAccountName=system:serviceaccount:kyverno:kyverno-background-controller --caSecretName=kyverno-svc.kyverno.svc.kyverno-tls-ca  --tlsSecretName=kyverno-svc.kyverno.svc.kyverno-tls-pair
 ```
 
 You will need to adapt those steps to run debug sessions in your IDE of choice, but the general idea remains the same.
+
+
+## Profiling
+
+### Enable profiling
+To profile Kyverno application running inside a Kubernetes pod, set `--profile` flag to `true` in [install.yaml](https://github.com/kyverno/kyverno/blob/main/definitions/install.yaml). The default profiling port is 6060, and it can be configured via `profile-port`.
+
+```
+  --profile
+        Set this flag to 'true', to enable profiling.
+  --profile-port string
+        Enable profiling at given port, defaults to 6060. (default "6060")
+```
+
+### Expose the endpoint on a local port
+You can get at the application in the pod by port forwarding with kubectl, for example:
+
+````shell
+$ kubectl -n kyverno get pod
+NAME                                             READY   STATUS      RESTARTS       AGE
+kyverno-admission-controller-57df6c565f-pxpnh    1/1     Running     0              20s
+kyverno-background-controller-766589695-dhj9m    1/1     Running     0              20s
+kyverno-cleanup-controller-54466dfbc6-5mlrc      1/1     Running     0              19s
+kyverno-cleanup-update-requests-28695530-ft975   1/1     Running     0              19s
+kyverno-reports-controller-76c49549f4-tljwm      1/1     Running     0              20s
+````
+
+Check the port of the pod you'd like to forward using the command below.
+
+````bash
+$ kubectl get pod kyverno-admission-controller-57df6c565f-pxpnh -n kyverno  --template='{{(index (index .spec.containers 0).ports 0).containerPort}}{{"\n"}}'
+9443
+````
+
+Use the exposed port from above to run port-forward with the below command.
+
+````bash
+$ kubectl -n kyverno port-forward kyverno-admission-controller-57df6c565f-pxpnh 6060:9443
+Forwarding from 127.0.0.1:6060 -> 9443
+Forwarding from [::1]:6060 -> 9443
+````
+
+The HTTP endpoint will now be available as a local port.
+
+Alternatively, use a Service of the type `LoadBalancer` to expose Kyverno. An example Service manifest is given below:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: pproc-service
+  namespace: kyverno
+spec:
+  selector:
+    app: kyverno
+  ports:
+    - protocol: TCP
+      port: 6060
+      targetPort: 6060
+  type: LoadBalancer
+```
+
+
+### Generate the data
+You can then generate the file for the **memory** profile with curl and pipe the data to a file:
+````shell
+$ curl http://localhost:6060/debug/pprof/heap  > heap.pprof
+````
+
+Generate the file for the **CPU** profile with curl and pipe the data to a file:
+```shell
+curl "http://localhost:6060/debug/pprof/profile?seconds=60" > cpu.pprof
+```
+
+### Analyze the data
+To analyze the data:
+````shell
+go tool pprof heap.pprof
+````
+
+### Read more about profiling
+
+- [Profiling Golang Programs on Kubernetes](https://danlimerick.wordpress.com/2017/01/24/profiling-golang-programs-on-kubernetes/)
+- [Official GO blog](https://blog.golang.org/pprof)
+
+## API Design
+
+See [docs/dev/api](./docs/dev/api/README.md)
+
+## Controllers Design
+
+See [docs/dev/controllers](./docs/dev/controllers/README.md)
+
+## Logging
+
+See [docs/dev/logging/logging.md](./docs/dev/logging/logging.md)
+
+## Feature Flags
+
+See [docs/dev/feature-flags](./docs/dev/feature-flags/README.md)
+
+## Reports Design
+
+See [docs/dev/reports](./docs/dev/reports/README.md)
+
+## Troubleshooting
+
+See [docs/dev/troubleshooting](./docs/dev/troubleshooting/)
+
+## Selecting Issues
+
+When you are ready to contribute, you can select issue at [Good First Issues](https://github.com/orgs/kyverno/projects/10). 

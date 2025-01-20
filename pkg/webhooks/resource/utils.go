@@ -6,7 +6,7 @@ import (
 
 	"github.com/go-logr/logr"
 	kyvernov1 "github.com/kyverno/kyverno/api/kyverno/v1"
-	kyvernov1beta1 "github.com/kyverno/kyverno/api/kyverno/v1beta1"
+	kyvernov2 "github.com/kyverno/kyverno/api/kyverno/v2"
 	engineapi "github.com/kyverno/kyverno/pkg/engine/api"
 	engineutils "github.com/kyverno/kyverno/pkg/engine/utils"
 	admissionutils "github.com/kyverno/kyverno/pkg/utils/admission"
@@ -16,20 +16,19 @@ import (
 )
 
 type updateRequestResponse struct {
-	ur  kyvernov1beta1.UpdateRequestSpec
+	ur  kyvernov2.UpdateRequestSpec
 	err error
 }
 
-func errorResponse(logger logr.Logger, uid types.UID, err error, message string) *admissionv1.AdmissionResponse {
+func errorResponse(logger logr.Logger, uid types.UID, err error, message string) admissionv1.AdmissionResponse {
 	logger.Error(err, message)
 	return admissionutils.Response(uid, errors.New(message+": "+err.Error()))
 }
 
-func patchRequest(patches []byte, request *admissionv1.AdmissionRequest, logger logr.Logger) *admissionv1.AdmissionRequest {
+func patchRequest(patches []byte, request admissionv1.AdmissionRequest, logger logr.Logger) admissionv1.AdmissionRequest {
 	patchedResource := processResourceWithPatches(patches, request.Object.Raw, logger)
-	newRequest := request.DeepCopy()
-	newRequest.Object.Raw = patchedResource
-	return newRequest
+	request.Object.Raw = patchedResource
+	return request
 }
 
 func processResourceWithPatches(patch []byte, resource []byte, log logr.Logger) []byte {
@@ -47,50 +46,77 @@ func processResourceWithPatches(patch []byte, resource []byte, log logr.Logger) 
 
 func applyUpdateRequest(
 	ctx context.Context,
-	request *admissionv1.AdmissionRequest,
-	ruleType kyvernov1beta1.RequestType,
+	request admissionv1.AdmissionRequest,
+	ruleType kyvernov2.RequestType,
 	urGenerator updaterequest.Generator,
-	userRequestInfo kyvernov1beta1.RequestInfo,
+	userRequestInfo kyvernov2.RequestInfo,
 	action admissionv1.Operation,
 	engineResponses ...*engineapi.EngineResponse,
 ) (failedUpdateRequest []updateRequestResponse) {
-	admissionRequestInfo := kyvernov1beta1.AdmissionRequestInfoObject{
-		AdmissionRequest: request,
+	admissionRequestInfo := kyvernov2.AdmissionRequestInfoObject{
+		AdmissionRequest: &request,
 		Operation:        action,
 	}
 
 	for _, er := range engineResponses {
-		ur := transform(admissionRequestInfo, userRequestInfo, er, ruleType)
-		if err := urGenerator.Apply(ctx, ur, action); err != nil {
-			failedUpdateRequest = append(failedUpdateRequest, updateRequestResponse{ur: ur, err: err})
+		urs := transform(admissionRequestInfo, userRequestInfo, er, ruleType)
+		for _, ur := range urs {
+			if err := urGenerator.Apply(ctx, ur); err != nil {
+				failedUpdateRequest = append(failedUpdateRequest, updateRequestResponse{ur: ur, err: err})
+			}
 		}
 	}
 
 	return
 }
 
-func transform(admissionRequestInfo kyvernov1beta1.AdmissionRequestInfoObject, userRequestInfo kyvernov1beta1.RequestInfo, er *engineapi.EngineResponse, ruleType kyvernov1beta1.RequestType) kyvernov1beta1.UpdateRequestSpec {
+func transform(admissionRequestInfo kyvernov2.AdmissionRequestInfoObject, userRequestInfo kyvernov2.RequestInfo, er *engineapi.EngineResponse, ruleType kyvernov2.RequestType) (urs []kyvernov2.UpdateRequestSpec) {
 	var PolicyNameNamespaceKey string
-	if er.Policy.GetNamespace() != "" {
-		PolicyNameNamespaceKey = er.Policy.GetNamespace() + "/" + er.Policy.GetName()
+	if er.Policy().GetNamespace() != "" {
+		PolicyNameNamespaceKey = er.Policy().GetNamespace() + "/" + er.Policy().GetName()
 	} else {
-		PolicyNameNamespaceKey = er.Policy.GetName()
+		PolicyNameNamespaceKey = er.Policy().GetName()
 	}
 
-	ur := kyvernov1beta1.UpdateRequestSpec{
-		Type:   ruleType,
-		Policy: PolicyNameNamespaceKey,
-		Resource: kyvernov1.ResourceSpec{
-			Kind:       er.Resource.GetKind(),
-			Namespace:  er.Resource.GetNamespace(),
-			Name:       er.Resource.GetName(),
-			APIVersion: er.Resource.GetAPIVersion(),
-		},
-		Context: kyvernov1beta1.UpdateRequestSpecContext{
-			UserRequestInfo:      userRequestInfo,
-			AdmissionRequestInfo: admissionRequestInfo,
-		},
+	for _, rule := range er.PolicyResponse.Rules {
+		ur := kyvernov2.UpdateRequestSpec{
+			Type:   ruleType,
+			Policy: PolicyNameNamespaceKey,
+			Rule:   rule.Name(),
+			Resource: kyvernov1.ResourceSpec{
+				Kind:       er.Resource.GetKind(),
+				Namespace:  er.Resource.GetNamespace(),
+				Name:       er.Resource.GetName(),
+				APIVersion: er.Resource.GetAPIVersion(),
+				UID:        er.Resource.GetUID(),
+			},
+			Context: kyvernov2.UpdateRequestSpecContext{
+				UserRequestInfo:      userRequestInfo,
+				AdmissionRequestInfo: admissionRequestInfo,
+			},
+		}
+		urs = append(urs, ur)
 	}
 
-	return ur
+	return urs
+}
+
+func skipBackgroundRequests(policy kyvernov1.PolicyInterface, logger logr.Logger, bgsaDesired, bgsaActual string) kyvernov1.PolicyInterface {
+	policyNew := policy.CreateDeepCopy()
+	policyNew.GetSpec().Rules = nil
+	for _, rule := range policy.GetSpec().Rules {
+		skipBackgroundRequests := true
+		if rule.SkipBackgroundRequests != nil {
+			skipBackgroundRequests = *rule.SkipBackgroundRequests
+		}
+		if skipBackgroundRequests && (bgsaDesired == bgsaActual) {
+			continue
+		}
+		logger.V(4).Info("applying background rule", "rule", rule.Name, "skipBackgroundRequests", rule.SkipBackgroundRequests, "backgroundSaDesired", bgsaDesired, "backgroundSaActual", bgsaActual)
+		policyNew.GetSpec().Rules = append(policyNew.GetSpec().Rules, *rule.DeepCopy())
+	}
+	if len(policyNew.GetSpec().Rules) == 0 {
+		return nil
+	}
+	return policyNew
 }

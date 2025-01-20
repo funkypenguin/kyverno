@@ -1,10 +1,55 @@
-initContainer:
-  extraArgs:
-    - --loggingFormat=json
+features:
+  policyExceptions:
+    enabled: true
+    namespace: "*"
+  omitEvents:
+    eventTypes: []
 
-extraArgs:
-  - --loggingFormat=json
-  - --enablePolicyException
+admissionController:
+  extraArgs:
+    v: 4
+  rbac:
+    clusterRole:
+      extraResources:
+        - apiGroups:
+            - '*'
+          resources:
+            - secrets
+          verbs:
+            - create
+            - update
+            - patch
+            - delete
+            - get
+            - list
+
+backgroundController:
+  extraArgs:
+    v: 4
+  rbac:
+    clusterRole:
+      extraResources:
+        - apiGroups:
+            - '*'
+          resources:
+            - configmaps
+            - networkpolicies
+            - resourcequotas
+            - secrets
+            - roles
+            - rolebindings
+            - limitranges
+            - namespaces
+            - nodes
+            - nodes/status
+            - pods
+          verbs:
+            - create
+            - update
+            - patch
+            - delete
+            - get
+            - list
 
 cleanupController:
   rbac:
@@ -14,24 +59,6 @@ cleanupController:
             - ''
           resources:
             - pods
-
-reportsController:
-  extraArgs:
-    - --enablePolicyException
-
-backgroundController:
-  rbac:
-    clusterRole:
-      extraResources:
-        - apiGroups:
-            - '*'
-          resources:
-            - configmaps
-            - secrets
-            - roles
-            - rolebindings
-            - limitranges
-            - namespaces
-            - nodes
-            - nodes/status
-            - pods
+          verbs:
+            - list
+            - delete

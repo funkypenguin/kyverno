@@ -18,8 +18,6 @@ limitations under the License.
 
 package v2alpha1
 
-type CleanupPolicyExpansion interface{}
+type GlobalContextEntryExpansion interface{}
 
-type ClusterCleanupPolicyExpansion interface{}
-
-type PolicyExceptionExpansion interface{}
+type ValidatingPolicyExpansion interface{}

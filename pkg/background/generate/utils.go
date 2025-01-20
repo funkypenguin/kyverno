@@ -1,34 +1,48 @@
 package generate
 
 import (
-	"fmt"
-	"strconv"
-
-	kyvernov1beta1 "github.com/kyverno/kyverno/api/kyverno/v1beta1"
+	kyvernov1 "github.com/kyverno/kyverno/api/kyverno/v1"
+	"github.com/kyverno/kyverno/pkg/background/common"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 )
 
-func increaseRetryAnnotation(ur *kyvernov1beta1.UpdateRequest) (int, map[string]string, error) {
-	urAnnotations := ur.Annotations
-	if len(urAnnotations) == 0 {
-		urAnnotations = map[string]string{
-			urAnnotations[kyvernov1beta1.URGenerateRetryCountAnnotation]: "1",
+func newResourceSpec(genAPIVersion, genKind, genNamespace, genName string) kyvernov1.ResourceSpec {
+	return kyvernov1.ResourceSpec{
+		APIVersion: genAPIVersion,
+		Kind:       genKind,
+		Namespace:  genNamespace,
+		Name:       genName,
+	}
+}
+
+func TriggerFromLabels(labels map[string]string) kyvernov1.ResourceSpec {
+	group := labels[common.GenerateTriggerGroupLabel]
+	version := labels[common.GenerateTriggerVersionLabel]
+	apiVersion := schema.GroupVersion{Group: group, Version: version}
+
+	return kyvernov1.ResourceSpec{
+		Kind:       labels[common.GenerateTriggerKindLabel],
+		Namespace:  labels[common.GenerateTriggerNSLabel],
+		Name:       labels[common.GenerateTriggerNameLabel],
+		UID:        types.UID(labels[common.GenerateTriggerUIDLabel]),
+		APIVersion: apiVersion.String(),
+	}
+}
+
+func buildPolicyWithAppliedRules(policy kyvernov1.PolicyInterface, expect string) (kyvernov1.PolicyInterface, bool) {
+	var rule *kyvernov1.Rule
+	p := policy.CreateDeepCopy()
+	for j := range p.GetSpec().Rules {
+		if p.GetSpec().Rules[j].Name == expect {
+			rule = &p.GetSpec().Rules[j]
+			break
 		}
 	}
-
-	retry := 1
-	val, ok := urAnnotations[kyvernov1beta1.URGenerateRetryCountAnnotation]
-	if !ok {
-		urAnnotations[kyvernov1beta1.URGenerateRetryCountAnnotation] = "1"
-	} else {
-		retryUint, err := strconv.ParseUint(val, 10, 64)
-		if err != nil {
-			return retry, urAnnotations, fmt.Errorf("unable to convert retry-count %v: %w", val, err)
-		}
-		retry = int(retryUint)
-		retry += 1
-		incrementedRetryString := strconv.Itoa(retry)
-		urAnnotations[kyvernov1beta1.URGenerateRetryCountAnnotation] = incrementedRetryString
+	if rule == nil {
+		return nil, false
 	}
 
-	return retry, urAnnotations, nil
+	p.GetSpec().SetRules([]kyvernov1.Rule{*rule})
+	return p, true
 }

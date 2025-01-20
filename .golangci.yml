@@ -38,13 +38,17 @@ linters:
     - unused
     - wastedassign
     - whitespace
+    - prealloc
 
 run:
-  timeout: 10m
-  skip-files:
+  timeout: 15m
+
+issues:
+  exclude-files:
     - ".+\\.generated.go"
     - ".+_test.go"
     - ".+_test_.+.go"
+    - docs/perf-testing/
 
 linters-settings:
   importas:
